@@ -13,26 +13,38 @@ import androidx.annotation.LayoutRes;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.UiThread;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.util.Pools;
+import androidx.core.view.LayoutInflaterCompat;
 
-import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author 吴灏腾
  * @date 2019-12-19
- * @describe TODO
+ * @describe AsyncLayoutInflate优化
  */
 public class AsyncLayoutInflatePlus {
     private static final String TAG = "AsyncLayoutInflatePlus";
 
+    private Pools.SynchronizedPool<InflateRequest> mRequestPool = new Pools.SynchronizedPool<>(10);
+
     LayoutInflater mInflater;
     Handler mHandler;
-    InflateThread mInflateThread;
+    Dispather mDispatcher;
+
 
     public AsyncLayoutInflatePlus(@NonNull Context context) {
         mInflater = new BasicInflater(context);
         mHandler = new Handler(mHandlerCallback);
-        mInflateThread = InflateThread.getInstance();
+        mDispatcher = new Dispather();
     }
 
     @UiThread
@@ -41,12 +53,12 @@ public class AsyncLayoutInflatePlus {
         if (callback == null) {
             throw new NullPointerException("callback argument may not be null!");
         }
-        InflateRequest request = mInflateThread.obtainRequest();
+        InflateRequest request = obtainRequest();
         request.inflater = this;
         request.resid = resid;
         request.parent = parent;
         request.callback = callback;
-        mInflateThread.enqueue(request);
+        mDispatcher.enqueue(request);
     }
 
     private Handler.Callback mHandlerCallback = new Handler.Callback() {
@@ -59,7 +71,7 @@ public class AsyncLayoutInflatePlus {
             }
             request.callback.onInflateFinished(
                     request.view, request.resid, request.parent);
-            mInflateThread.releaseRequest(request);
+            releaseRequest(request);
             return true;
         }
     };
@@ -80,6 +92,51 @@ public class AsyncLayoutInflatePlus {
         }
     }
 
+
+    private static class Dispather {
+
+        //获得当前CPU的核心数
+        private static final int CPU_COUNT = Runtime.getRuntime().availableProcessors();
+        //设置线程池的核心线程数2-4之间,但是取决于CPU核数
+        private static final int CORE_POOL_SIZE = Math.max(2, Math.min(CPU_COUNT - 1, 4));
+        //设置线程池的最大线程数为 CPU核数 * 2 + 1
+        private static final int MAXIMUM_POOL_SIZE = CPU_COUNT * 2 + 1;
+        //设置线程池空闲线程存活时间30s
+        private static final int KEEP_ALIVE_SECONDS = 30;
+
+        private static final ThreadFactory sThreadFactory = new ThreadFactory() {
+            private final AtomicInteger mCount = new AtomicInteger(1);
+
+            public Thread newThread(Runnable r) {
+                return new Thread(r, "AsyncLayoutInflatePlus #" + mCount.getAndIncrement());
+            }
+        };
+
+        //LinkedBlockingQueue 默认构造器，队列容量是Integer.MAX_VALUE
+        private static final BlockingQueue<Runnable> sPoolWorkQueue =
+                new LinkedBlockingQueue<Runnable>();
+
+        /**
+         * An {@link Executor} that can be used to execute tasks in parallel.
+         */
+        public static final ThreadPoolExecutor THREAD_POOL_EXECUTOR;
+
+        static {
+            Log.i(TAG, "static initializer: " + " CPU_COUNT = " + CPU_COUNT + " CORE_POOL_SIZE = " + CORE_POOL_SIZE + " MAXIMUM_POOL_SIZE = " + MAXIMUM_POOL_SIZE);
+            ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
+                    CORE_POOL_SIZE, MAXIMUM_POOL_SIZE, KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+                    sPoolWorkQueue, sThreadFactory);
+            threadPoolExecutor.allowCoreThreadTimeOut(true);
+            THREAD_POOL_EXECUTOR = threadPoolExecutor;
+        }
+
+        public void enqueue(InflateRequest request) {
+            THREAD_POOL_EXECUTOR.execute((new InflateRunnable(request)));
+
+        }
+
+    }
+
     private static class BasicInflater extends LayoutInflater {
         private static final String[] sClassPrefixList = {
                 "android.widget.",
@@ -89,6 +146,13 @@ public class AsyncLayoutInflatePlus {
 
         BasicInflater(Context context) {
             super(context);
+            if (context instanceof AppCompatActivity) {
+                // 手动setFactory2，兼容AppCompatTextView等控件
+                AppCompatDelegate appCompatDelegate = ((AppCompatActivity) context).getDelegate();
+                if (appCompatDelegate instanceof LayoutInflater.Factory2) {
+                    LayoutInflaterCompat.setFactory2(this, (LayoutInflater.Factory2) appCompatDelegate);
+                }
+            }
         }
 
         @Override
@@ -114,34 +178,18 @@ public class AsyncLayoutInflatePlus {
         }
     }
 
-    private static class InflateThread extends Thread {
-        private static final InflateThread sInstance;
 
-        static {
-            sInstance = new InflateThread();
-            sInstance.start();
+    private static class InflateRunnable implements Runnable {
+        private InflateRequest request;
+        private boolean isRunning;
+
+        public InflateRunnable(InflateRequest request) {
+            this.request = request;
         }
 
-        public static InflateThread getInstance() {
-            return sInstance;
-        }
-
-        private ArrayBlockingQueue<InflateRequest> mQueue = new ArrayBlockingQueue<>(10);
-        private Pools.SynchronizedPool<InflateRequest> mRequestPool = new Pools.SynchronizedPool<>(10);
-
-        // Extracted to its own method to ensure locals have a constrained liveness
-        // scope by the GC. This is needed to avoid keeping previous request references
-        // alive for an indeterminate amount of time, see b/33158143 for details
-        public void runInner() {
-            InflateRequest request;
-            try {
-                request = mQueue.take();
-            } catch (InterruptedException ex) {
-                // Odd, just continue
-                Log.w(TAG, ex);
-                return;
-            }
-
+        @Override
+        public void run() {
+            isRunning = true;
             try {
                 request.view = request.inflater.mInflater.inflate(
                         request.resid, request.parent, false);
@@ -154,37 +202,32 @@ public class AsyncLayoutInflatePlus {
                     .sendToTarget();
         }
 
-        @Override
-        public void run() {
-            while (true) {
-                runInner();
-            }
+        public boolean isRunning() {
+            return isRunning;
         }
+    }
 
-        public InflateRequest obtainRequest() {
-            InflateRequest obj = mRequestPool.acquire();
-            if (obj == null) {
-                obj = new InflateRequest();
-            }
-            return obj;
-        }
 
-        public void releaseRequest(InflateRequest obj) {
-            obj.callback = null;
-            obj.inflater = null;
-            obj.parent = null;
-            obj.resid = 0;
-            obj.view = null;
-            mRequestPool.release(obj);
+    public InflateRequest obtainRequest() {
+        InflateRequest obj = mRequestPool.acquire();
+        if (obj == null) {
+            obj = new InflateRequest();
         }
+        return obj;
+    }
 
-        public void enqueue(InflateRequest request) {
-            try {
-                mQueue.put(request);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(
-                        "Failed to enqueue async inflate request", e);
-            }
-        }
+    public void releaseRequest(InflateRequest obj) {
+        obj.callback = null;
+        obj.inflater = null;
+        obj.parent = null;
+        obj.resid = 0;
+        obj.view = null;
+        mRequestPool.release(obj);
+    }
+
+
+    public void cancel() {
+        mHandler.removeCallbacksAndMessages(null);
+        mHandlerCallback = null;
     }
 }
